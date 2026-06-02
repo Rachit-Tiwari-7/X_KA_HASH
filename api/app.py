@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+import os
+import time
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+from .routes import backtest_routes, bars_routes, cfa, chart_routes, config, flows, hedge_fund, market_data, metrics, mmc, portfolio, signals, stream, structure, trades, global_market
+from .routes.ws import router as ws_router
+from .websocket_manager import manager as ws_manager
+from .state import seed_demo_data
+from .routes.orders import router as orders_router
+from .routes.positions import router as positions_router
+from .routes.risk import router as risk_router
+from .routes.paper import router as paper_router
+from .routes.agent import agent_v1
+from .routes.portfolio_optimization import router as portfolio_opt_router
+from .routes.factor_analysis import router as factor_analysis_router
+from .routes.rl_training import router as rl_training_router
+from .routes.research.sql_research import router as sql_research_router
+from .routes.finscript import router as finscript_router
+from .routes.ta_routes import router as ta_router
+from .routes.correlation_routes import router as correlation_router
+from .routes.workspace_routes import router as workspace_router
+from .routes.alpha_zoo_routes import router as alpha_zoo_router
+from .routes.geo_analysis_routes import router as geo_analysis_router
+from .routes.experiment_routes import router as experiment_router
+from .routes.swarm_routes import router as swarm_router
+from .routes.hypothesis_routes import router as hypothesis_router
+from .routes.china_markets_routes import router as china_markets_router
+from .routes.backtest_cache_routes import router as backtest_cache_router
+from .routes.protections_routes import router as protections_router
+from .routes.pairlists_routes import router as pairlists_router
+from .routes.debate_routes import router as debate_router
+from .routes.providers_routes import router as providers_router
+from .routes.mcp_routes import router as mcp_router
+from .routes.workflow_routes import router as workflow_router
+from .routes.hyperopt_routes import router as hyperopt_router
+from .routes.agent import health as agent_health
+from .routes.agent import markets as agent_markets
+from .routes.agent import strategies as agent_strategies
+from .routes.agent import backtests as agent_backtests
+from .routes.agent import jobs as agent_jobs
+from .routes.agent import admin as agent_admin
+from .routes.signals_stream import router as signals_stream_router
+from .routes.risk_live import router as risk_live_router
+from .routes.portfolio_whatif import router as portfolio_whatif_router
+from .routes.strategy_clone import router as strategy_clone_router
+from .routes.llm import router as llm_router
+from .routes.screener_routes import router as screener_router
+from .routes.renaissance import router as renaissance_router
+from .routes.integrations_routes import router as integrations_router
+from .routes.analytics_routes import router as analytics_router
+from .routes.audit_routes import router as audit_router
+from .routes.providers_v2 import router as providers_v2_router
+from .routes.hypotheses_v2 import router as hypotheses_v2_router
+from .routes.market_intel import router as market_intel_router
+from persistence import init_db, close_db
+from persistence.database import _engine as db_engine
+
+logger = logging.getLogger(__name__)
+
+_start_time = time.time()
+
+_background_tasks: list[asyncio.Task] = []
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+async def _market_news_loop():
+    from .market_intel import refresh_market_news_snapshots
+
+    refresh_interval = _env_int("MARKET_NEWS_REFRESH_INTERVAL", 3600, minimum=300)
+    await asyncio.sleep(3)
+    while True:
+        try:
+            result = await asyncio.to_thread(refresh_market_news_snapshots)
+            logger.info("Market Intel: Refreshed news snapshots: inserted=%s errors=%d",
+                        result.get("inserted_categories", 0), len(result.get("errors", {})))
+        except Exception as e:
+            logger.error("Market Intel Error: %s", e)
+        logger.info("Market Intel: Next news refresh in %d seconds", refresh_interval)
+        await asyncio.sleep(refresh_interval)
+
+
+async def _macro_signal_loop():
+    from .market_intel import refresh_macro_signal_snapshot
+
+    refresh_interval = _env_int("MACRO_SIGNAL_REFRESH_INTERVAL", 3600, minimum=300)
+    await asyncio.sleep(6)
+    while True:
+        try:
+            result = await asyncio.to_thread(refresh_macro_signal_snapshot)
+            logger.info("Market Intel: Refreshed macro signals: verdict=%s signals=%d",
+                        result.get("verdict"), result.get("total_count", 0))
+        except Exception as e:
+            logger.error("Macro Signal Error: %s", e)
+        logger.info("Market Intel: Next macro signal refresh in %d seconds", refresh_interval)
+        await asyncio.sleep(refresh_interval)
+
+
+async def _etf_flow_loop():
+    from .market_intel import refresh_etf_flow_snapshot
+
+    refresh_interval = _env_int("ETF_FLOW_REFRESH_INTERVAL", 3600, minimum=300)
+    await asyncio.sleep(9)
+    while True:
+        try:
+            result = await asyncio.to_thread(refresh_etf_flow_snapshot)
+            logger.info("Market Intel: Refreshed ETF flows: direction=%s tracked=%d",
+                        result.get("direction"), result.get("tracked_count", 0))
+        except Exception as e:
+            logger.error("ETF Flow Error: %s", e)
+        logger.info("Market Intel: Next ETF flow refresh in %d seconds", refresh_interval)
+        await asyncio.sleep(refresh_interval)
+
+
+async def _stock_analysis_loop():
+    from .market_intel import refresh_stock_analysis_snapshots
+
+    refresh_interval = _env_int("STOCK_ANALYSIS_REFRESH_INTERVAL", 7200, minimum=600)
+    await asyncio.sleep(12)
+    while True:
+        try:
+            result = await asyncio.to_thread(refresh_stock_analysis_snapshots)
+            logger.info("Market Intel: Refreshed stock analysis: inserted=%s errors=%d",
+                        result.get("inserted_symbols", 0), len(result.get("errors", {})))
+        except Exception as e:
+            logger.error("Stock Analysis Error: %s", e)
+        logger.info("Market Intel: Next stock analysis refresh in %d seconds", refresh_interval)
+        await asyncio.sleep(refresh_interval)
+
+
+_BACKGROUND_TASK_REGISTRY: dict[str, callable] = {
+    "market_news": _market_news_loop,
+    "macro_signals": _macro_signal_loop,
+    "etf_flows": _etf_flow_loop,
+    "stock_analysis": _stock_analysis_loop,
+}
+
+
+def get_enabled_background_tasks() -> list[str]:
+    raw = os.getenv("TRADING_ENGINE_BACKGROUND_TASKS", "market_news,macro_signals,etf_flows,stock_analysis")
+    return [name.strip() for name in raw.split(",") if name.strip() in _BACKGROUND_TASK_REGISTRY]
+
+
+def start_background_tasks():
+    global _background_tasks
+    for name in get_enabled_background_tasks():
+        task_func = _BACKGROUND_TASK_REGISTRY[name]
+        logger.info("Starting background task: %s", name)
+        _background_tasks.append(asyncio.create_task(task_func(), name=f"trading-engine:{name}"))
+    _background_tasks.append(asyncio.create_task(ws_manager.periodic_cleanup(), name="trading-engine:ws-cleanup"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    await seed_demo_data()
+    if _env_bool("TRADING_ENGINE_MARKET_INTEL_ENABLED", True):
+        start_background_tasks()
+    yield
+    for task in _background_tasks:
+        task.cancel()
+    await close_db()
+
+
+def _check_db():
+    try:
+        if db_engine is not None:
+            return {"status": "ok", "backend": str(db_engine.url)}
+        return {"status": "deferred"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def _check_ccxt():
+    try:
+        import ccxt
+        return {"status": "ok", "version": getattr(ccxt, "__version__", "unknown")}
+    except ImportError:
+        return {"status": "unavailable"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def create_app(title: str = "Trading Engine API") -> FastAPI:
+    app = FastAPI(title=title, version="0.2.0", lifespan=lifespan)
+
+    raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
+    cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    allow_all = "*" in cors_origins
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"] if allow_all else cors_origins,
+        allow_credentials=not allow_all,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    if allow_all:
+        logger.info("CORS: allowing all origins (credentials disabled)")
+
+    limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
+    logger.info("No authentication — all routes open")
+
+    app.include_router(signals.router)
+    app.include_router(portfolio.router)
+    app.include_router(market_data.router)
+    app.include_router(metrics.router)
+    app.include_router(stream.router)
+    app.include_router(trades.router)
+    app.include_router(backtest_routes.router)
+    app.include_router(chart_routes.router)
+    app.include_router(bars_routes.router)
+    app.include_router(hedge_fund.router)
+    app.include_router(flows.router)
+    app.include_router(structure.router)
+    app.include_router(cfa.router)
+    app.include_router(mmc.router)
+    app.include_router(config.router)
+    app.include_router(orders_router)
+    app.include_router(positions_router)
+    app.include_router(risk_router)
+    app.include_router(paper_router)
+    app.include_router(ws_router)
+    app.include_router(global_market.router)
+    app.include_router(agent_v1)
+    app.include_router(portfolio_opt_router)
+    app.include_router(factor_analysis_router)
+    app.include_router(rl_training_router)
+    app.include_router(sql_research_router)
+    app.include_router(finscript_router)
+    app.include_router(ta_router)
+    app.include_router(correlation_router)
+    app.include_router(workspace_router)
+    app.include_router(alpha_zoo_router)
+    app.include_router(geo_analysis_router)
+    app.include_router(experiment_router)
+    app.include_router(swarm_router)
+    app.include_router(hypothesis_router)
+    app.include_router(china_markets_router)
+    app.include_router(backtest_cache_router)
+    app.include_router(protections_router)
+    app.include_router(pairlists_router)
+    app.include_router(debate_router)
+    app.include_router(providers_router)
+    app.include_router(mcp_router)
+    app.include_router(workflow_router)
+    app.include_router(hyperopt_router)
+    app.include_router(signals_stream_router)
+    app.include_router(risk_live_router)
+    app.include_router(portfolio_whatif_router)
+    app.include_router(strategy_clone_router)
+    app.include_router(llm_router)
+    app.include_router(screener_router)
+    app.include_router(renaissance_router)
+    app.include_router(integrations_router)
+    app.include_router(analytics_router)
+    app.include_router(audit_router)
+    app.include_router(providers_v2_router)
+    app.include_router(hypotheses_v2_router)
+    app.include_router(market_intel_router)
+
+    @app.get("/")
+    async def root():
+        return RedirectResponse(url="/docs")
+
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "uptime_seconds": int(time.time() - _start_time),
+            "dependencies": {
+                "database": _check_db(),
+                "ccxt": _check_ccxt(),
+            },
+        }
+
+    @app.get("/api/health")
+    async def api_health():
+        return await health()
+
+    return app
+
+
+app = create_app()
