@@ -1,0 +1,195 @@
+import { useEffect, useRef, useState } from 'react'
+import { AlertTriangle } from 'lucide-react'
+import { fetchQuotes } from '../api/client'
+
+interface TickerItem {
+  symbol: string
+  price: string
+  change: string
+  up: boolean
+  sparkline: number[]
+  volume?: number
+}
+
+const SYMBOLS = ['SPY', 'QQQ', 'DIA', 'IWM', 'BTC-USD', 'ETH-USD', 'TSLA', 'AAPL', 'NVDA', 'AMZN', 'MSFT', 'GOOGL', 'META', 'AMD', 'INTC', 'NFLX', 'DIS', 'V', 'JPM', 'GS', 'BA', 'CAT', 'XOM', 'CVX', 'PFE', 'JNJ', 'KO', 'PEP', 'WMT']
+
+const MAX_SPARK_POINTS = 20
+
+function formatPrice(symbol: string, price: number): string {
+  if (symbol.includes('BTC') || symbol.includes('ETH')) return price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  if (price >= 1000) return price.toFixed(0)
+  if (price >= 100) return price.toFixed(1)
+  if (price >= 10) return price.toFixed(2)
+  if (price >= 1) return price.toFixed(3)
+  return price.toFixed(4)
+}
+
+function Sparkline({ data, up }: { data: number[]; up: boolean }) {
+  if (data.length < 2) return null
+  const w = 28; const h = 14
+  const min = Math.min(...data); const max = Math.max(...data)
+  const range = max - min || 1
+  const points = data.map((v, i) => {
+    const x = (i / (data.length - 1)) * (w - 2) + 1
+    const y = h - 1 - ((v - min) / range) * (h - 2)
+    return `${x},${y}`
+  }).join(' ')
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} className="shrink-0" style={{ marginRight: 4 }}>
+      <polyline points={points} fill="none" stroke={up ? 'var(--accent-green)' : 'var(--accent-red)'} strokeWidth={1} />
+    </svg>
+  )
+}
+
+export default function MarketTickerBar() {
+  const [paused, setPaused] = useState(false)
+  const priceHistory = useRef<Map<string, number[]>>(new Map())
+  const prevPrices = useRef<Map<string, number>>(new Map())
+  const [flashMap, setFlashMap] = useState<Map<string, 'green' | 'red'>>(new Map())
+  const [tickers, setTickers] = useState<TickerItem[]>(SYMBOLS.map((s) => ({ symbol: s, price: '—', change: '', up: true, sparkline: [] })))
+  const [error, setError] = useState(false)
+  const [pulseItems, setPulseItems] = useState<Set<string>>(new Set())
+
+  useEffect(() => {
+    const abortController = new AbortController()
+    let interval: ReturnType<typeof setInterval> | null = null
+    let hidden = false
+
+    const load = async () => {
+      if (hidden) return
+      try {
+        const quotes = await fetchQuotes(SYMBOLS, abortController.signal)
+        const updated: TickerItem[] = []
+        const newFlash = new Map<string, 'green' | 'red'>()
+        let anySuccess = false
+        for (const s of SYMBOLS) {
+          const q = quotes[s]
+          if (q && q.c != null) {
+            anySuccess = true
+            const prevPrice = prevPrices.current.get(s)
+            if (prevPrice != null && q.c !== prevPrice) {
+              newFlash.set(s, q.c > prevPrice ? 'green' : 'red')
+              setPulseItems((prev) => new Set([...prev, s]))
+              setTimeout(() => setPulseItems((prev) => { const n = new Set(prev); n.delete(s); return n }), 300)
+            }
+            prevPrices.current.set(s, q.c)
+            const hist = priceHistory.current.get(s) || []
+            hist.push(q.c)
+            if (hist.length > MAX_SPARK_POINTS) hist.shift()
+            priceHistory.current.set(s, hist)
+            updated.push({
+              symbol: s,
+              price: formatPrice(s, q.c),
+              change: q.dp >= 0 ? `+${q.dp.toFixed(2)}%` : `${q.dp.toFixed(2)}%`,
+              up: q.dp >= 0,
+              sparkline: [...hist],
+              volume: q.v,
+            })
+          }
+        }
+        if (newFlash.size > 0) {
+          setFlashMap(newFlash)
+          setTimeout(() => setFlashMap(new Map()), 600)
+        }
+        if (anySuccess) setTickers(updated)
+        setError(!anySuccess)
+      } catch {
+        if (!abortController.signal.aborted) setError(true)
+      }
+    }
+    load()
+    interval = setInterval(load, 30000)
+
+    const onVisibility = () => {
+      hidden = document.hidden
+      if (interval) {
+        clearInterval(interval)
+        interval = null
+      }
+      if (!document.hidden) {
+        load()
+        interval = setInterval(load, 30000)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      clearInterval(interval!)
+      abortController.abort()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [])
+
+  const items = [...tickers, ...tickers]
+  const shouldAnimate = !paused
+
+  return (
+    <div
+      style={{
+        height: 24,
+        display: 'flex',
+        alignItems: 'center',
+        overflow: 'hidden',
+        userSelect: 'none',
+        cursor: 'default',
+        background: 'var(--ticker-bg)',
+        borderBottom: '1px solid var(--border-color)',
+        fontSize: 10,
+        fontFamily: "'JetBrains Mono', monospace",
+        position: 'sticky',
+        top: 0,
+        zIndex: 30,
+      }}
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+    >
+      {error && (
+        <div className="flex items-center gap-1 px-2 shrink-0" style={{ color: 'var(--accent-orange)', fontSize: 10 }}>
+          <AlertTriangle className="w-2.5 h-2.5" />
+          <span>RECONNECTING...</span>
+        </div>
+      )}
+      <div
+        className="flex items-center"
+        style={{
+          animation: shouldAnimate ? 'ticker-scroll 60s linear infinite' : 'none',
+          whiteSpace: 'nowrap' as const,
+        }}
+      >
+        {items.map((t, i) => (
+          <div
+            key={`${t.symbol}-${i}`}
+            className="flex items-center shrink-0"
+            style={{ padding: '0 10px', borderRight: '1px solid var(--border-color)', height: 24, position: 'relative' }}
+            aria-label={`${t.symbol}: ${t.price} ${t.change}`}
+          >
+            {pulseItems.has(t.symbol) && (
+              <span style={{ position: 'absolute', inset: -2, borderRadius: 2, border: `1px solid ${t.up ? 'var(--accent-green)' : 'var(--accent-red)'}`, opacity: 0.6, animation: 'pulse-glow 0.3s ease-out', pointerEvents: 'none' }} />
+            )}
+            <Sparkline data={t.sparkline} up={t.up} />
+            <span style={{ color: 'var(--accent-cyan)', fontWeight: 600, marginRight: 4 }}>{t.symbol}</span>
+            <span style={{ color: 'var(--ticker-text)', marginRight: 4 }}>{t.price}</span>
+            <span style={{ color: t.up ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+              {t.change}
+            </span>
+            {t.volume != null && (
+              <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 2, background: 'var(--bg-hover)' }}>
+                <div style={{ width: `${Math.min((t.volume / 10000000) * 100, 100)}%`, height: 2, background: t.up ? 'var(--accent-green)' : 'var(--accent-red)', opacity: 0.4 }} />
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      <div
+        style={{
+          position: 'absolute',
+          right: 0,
+          top: 0,
+          width: 40,
+          height: 24,
+          background: 'linear-gradient(to right, transparent, var(--ticker-bg))',
+          pointerEvents: 'none',
+        }}
+      />
+    </div>
+  )
+}
